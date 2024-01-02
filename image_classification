@@ -1,0 +1,113 @@
+import os, random, cv2
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import albumentations as alb
+from functools import partial
+from keras.layers import * #
+from keras.models import * #
+
+
+classes=tuple(np.load('Public_Storage/200birds_class.npz'))
+lab2cls=dict(zip(range(200),classes))
+cls2lab=dict(zip(classes,range(200)))
+
+def get_dataset(tfrecord_path):
+    def _parse_tfrecord(tfrecord):
+        features = {'image/label': tf.io.FixedLenFeature([], tf.int64),
+                    'image/encoded': tf.io.FixedLenFeature([], tf.string)}
+        sample = tf.io.parse_single_example(tfrecord, features)
+        x = tf.image.decode_jpeg(sample['image/encoded'], channels=3)
+
+        y = tf.cast(sample['image/label'], tf.float32)
+        x = tf.image.resize(x, (224, 224))
+        return x, y
+
+    return tf.data.TFRecordDataset(tfrecord_path).map(
+            _parse_tfrecord,
+            num_parallel_calls=tf.data.experimental.AUTOTUNE).prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+
+train_set=get_dataset('Public_Storage/200birds_train.tfrecord')
+valid_set=get_dataset('Public_Storage/200birds_valid.tfrecord')
+
+
+HorizontalFlip_probability = 0.1 # 이거 왜 성능이 높아지지? 원인불명 이유좀 알려주세요..
+
+# Rotation_probability= #Set here
+
+VerticalFlip_probability = 0.1 #
+
+
+transforms_train = alb.Compose([
+  # alb.Rotate(limit=Rotation_limit_degree, p=Rotation_probability),
+  alb.HorizontalFlip(p=HorizontalFlip_probability),
+  alb.VerticalFlip(p=VerticalFlip_probability),
+  alb.Resize(224,224, interpolation=cv2.INTER_CUBIC),
+])
+
+
+transforms_valid = alb.Compose([
+  alb.Resize(224,224, interpolation=cv2.INTER_CUBIC),
+])
+
+
+def train_aug_fn(image):
+  x = transforms_train(image=np.array(image, dtype=np.uint8))["image"]
+  x = tf.cast(x, tf.float32)
+  x = x/255.
+  return x
+
+
+def train_process_data(image, label):
+  aug_img = tf.numpy_function(func=train_aug_fn, inp=[image], Tout=tf.float32)
+  label = tf.cast(label, tf.int32)
+
+  return aug_img, label
+
+
+def valid_aug_fn(image):
+  x = transforms_valid(image=np.array(image, dtype=np.uint8))["image"]
+  x = tf.cast(x, tf.float32)
+  x = x/255.
+  return x
+
+def valid_process_data(image, label):
+  aug_img = tf.numpy_function(func=valid_aug_fn, inp=[image], Tout=tf.float32)
+  label = tf.cast(label, tf.int32)
+
+  return aug_img, label
+
+
+train_set = train_set.map(train_process_data, num_parallel_calls=tf.data.AUTOTUNE).batch(128).prefetch(tf.data.AUTOTUNE)
+valid_set = valid_set.map(valid_process_data, num_parallel_calls=tf.data.AUTOTUNE).batch(128).prefetch(tf.data.AUTOTUNE)
+
+
+model=tf.keras.applications.MobileNetV2(input_shape=(224,224,3), classes=200, weights='imagenet',include_top = False, classifier_activation='linear') # imagnet = 전이학습 pretraining model 사전에 학습된 모델을 사용하는 게 학습에 더 효과적
+
+
+output = model.output
+x = GlobalAveragePooling2D()(output) # 이 부분은 imagenet을 사용하려 했는데 에러가 떠서 잘하는 친구한테 도움을 요청해서 넣은 부분
+x = Dense(256, activation='relu')(x) # 대충 듣긴 했으나 이해가 안됨...
+output = Dense(200, activation='softmax', name='output')(x) #
+model = Model(inputs=model.input, outputs=output) #
+
+
+Learning_rate=0.01
+
+decay_steps= 10000 #5000 -> 10000
+end_learning_rate= 0.0005 #처음 0.001
+
+#InceptionResNetV2(Inception v3 모델에 ResNet 장점을 흡수시킨 모델) 사용했을 때
+# (decay_steps,end_learning_rate): (5000,0.001) --> 67.34 %  (5000,0.0005) ---> 67.08%  (10000, 0.0005) --> 69.97%
+# arugmentation = 0.1 로 수정 + (decay_steps,end_learning_rate) : (10000,0.0005) --> 69.71%
+
+Learning_rate=tf.keras.optimizers.schedules.PolynomialDecay(Learning_rate, decay_steps, end_learning_rate)
+
+
+optimizer=tf.keras.optimizers.SGD(learning_rate=Learning_rate) # adam을 sdg로 바꾸니까 정확도가 0.5%에서 수직상승  + 정확도가 안올라서 optimzer를 계속 바꿔봄 그랬더니 sgd에서 정확도가 확 오름
+
+loss=tf.keras.losses.SparseCategoricalCrossentropy()
+
+model.compile(optimizer, loss, metrics='sparse_categorical_accuracy')
+
+model.fit(train_set, validation_data=valid_set, epochs=100)
